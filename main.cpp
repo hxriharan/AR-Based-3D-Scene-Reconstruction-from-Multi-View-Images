@@ -1,84 +1,124 @@
+/*
+ * Author: Hariharan Sureshkumar
+ * Course: CS 5330 - Pattern Recognition and Computer Vision
+ * Semester: Spring 2025
+ *
+ * Purpose: Entry point for the 3D reconstruction pipeline; integrates all modules from loading images to outputting 3D results.
+ *
+ * This file is part of a custom 3D reconstruction pipeline project that
+ * implements feature-based structure-from-motion and sparse point cloud
+ * generation from multi-view RGB images, using OpenCV, Eigen, and Ceres.
+ */
+
+
 #include <iostream>
 #include <opencv2/opencv.hpp>
 
 #include "feature_detector.h"
 #include "matcher.h"
 #include "camera_pose.h"
-#include "triangulator.h"  // Include triangulation module
+#include "triangulator.h"
 #include "pointcloud_writer.h"
+#include "bundle_adjuster.h"
 
+int main() {
+    std::vector<std::string> image_paths = {
+        "../data/IMG_4452.jpg", "../data/IMG_4453.jpg", "../data/IMG_4454.jpg",
+        "../data/IMG_4455.jpg", "../data/IMG_4456.jpg"
+    };
 
-int main(int argc, char** argv) {
-    if (argc < 3) {
-        std::cerr << "Usage: ./reconstruction <image1> <image2>" << std::endl;
-        return -1;
-    }
-
-    std::string img_path1 = argv[1];
-    std::string img_path2 = argv[2];
-
-    cv::Mat img1 = cv::imread(img_path1, cv::IMREAD_GRAYSCALE);
-    cv::Mat img2 = cv::imread(img_path2, cv::IMREAD_GRAYSCALE);
-
-    if (img1.empty() || img2.empty()) {
-        std::cerr << "Error: Could not load input images." << std::endl;
-        return -1;
-    }
-
-    // Feature detection
-    FeatureDetector detector(true);  // true = use SIFT
-    std::vector<cv::KeyPoint> kp1, kp2;
-    cv::Mat desc1, desc2;
-
-    detector.detectAndCompute(img1, kp1, desc1);
-    detector.detectAndCompute(img2, kp2, desc2);
-
-    // Feature matching
-    FeatureMatcher matcher(true);  // true = use FLANN
-    std::vector<cv::DMatch> good_matches;
-    matcher.matchFeatures(desc1, desc2, good_matches);
-
-    // Estimate camera pose
+    // Intrinsics from calibration
     cv::Mat K = (cv::Mat_<double>(3, 3) <<
-        525.0, 0.0, 319.5,
-        0.0, 525.0, 239.5,
-        0.0, 0.0, 1.0);  // Intrinsics
+        3316.82226, 0.0,        1514.45791,
+        0.0,        3312.61390, 2016.30946,
+        0.0,        0.0,        1.0);
 
-    cv::Mat R, t;
+    cv::Mat distCoeffs = (cv::Mat_<double>(1, 5) <<
+        0.359860210, -2.54278576, 0.00220827891, 0.00116188064, 5.64587684);
+
+    std::vector<cv::Mat> images;
+    for (const auto& path : image_paths) {
+        cv::Mat img = cv::imread(path, cv::IMREAD_GRAYSCALE);
+        if (img.empty()) {
+            std::cerr << "Error loading image: " << path << std::endl;
+            return -1;
+        }
+        cv::Mat undistorted;
+        cv::undistort(img, undistorted, K, distCoeffs);
+        images.push_back(undistorted);
+    }
+
+    FeatureDetector detector(true);  // Use SIFT
+    std::vector<std::vector<cv::KeyPoint>> all_keypoints;
+    std::vector<cv::Mat> all_descriptors;
+
+    for (const auto& img : images) {
+        std::vector<cv::KeyPoint> kps;
+        cv::Mat desc;
+        detector.detectAndCompute(img, kps, desc);
+        all_keypoints.push_back(kps);
+        all_descriptors.push_back(desc);
+    }
+
+    FeatureMatcher matcher(true);  // Use FLANN
+    std::vector<std::vector<cv::DMatch>> all_matches;
+    for (size_t i = 0; i < images.size() - 1; ++i) {
+        std::vector<cv::DMatch> matches;
+        matcher.matchFeatures(all_descriptors[i], all_descriptors[i + 1], matches);
+        all_matches.push_back(matches);
+    }
+
     CameraPoseEstimator pose_estimator(K);
-    bool success = pose_estimator.estimatePose(kp1, kp2, good_matches, R, t);
+    Triangulator triangulator(K);
+    BundleAdjuster bundle_adjuster(K);
 
-    if (success) {
-        std::cout << "Estimated camera motion:" << std::endl;
-        std::cout << "Rotation matrix R:\n" << R << std::endl;
-        std::cout << "Translation vector t:\n" << t << std::endl;
+    std::vector<cv::Mat> rotations, translations;
+    std::vector<cv::Point3f> structure_points;
+    std::vector<BAObservation> observations;
+    std::vector<int> camera_indices;
+    std::vector<int> point_indices;
 
-        // Triangulate 3D points
-        std::vector<cv::Point3f> points3D;
-        Triangulator triangulator(K);
-        triangulator.triangulatePoints(kp1, kp2, good_matches, R, t, points3D);
+    // Initialize first camera at origin
+    rotations.push_back(cv::Mat::eye(3, 3, CV_64F));
+    translations.push_back(cv::Mat::zeros(3, 1, CV_64F));
 
-        std::cout << "\nFirst 10 Triangulated 3D Points:" << std::endl;
-        for (int i = 0; i < std::min(10, (int)points3D.size()); ++i) {
-            std::cout << points3D[i] << std::endl;
+    for (size_t i = 0; i < all_matches.size(); ++i) {
+        const auto& kp1 = all_keypoints[i];
+        const auto& kp2 = all_keypoints[i + 1];
+        const auto& matches = all_matches[i];
+
+        cv::Mat R, t;
+        bool success = pose_estimator.estimatePose(kp1, kp2, matches, R, t);
+        if (!success) {
+            std::cerr << "Pose estimation failed between " << i << " and " << i + 1 << std::endl;
+            continue;
         }
 
-        std::string ply_filename = "/Users/hariharansureshkumar/3D_Reconstruction_project/output/points3D.ply";
-        PointCloudWriter::writePLY(ply_filename, points3D);
-        std::cout << "Saved " << points3D.size() << " 3D points to " << ply_filename << std::endl;
+        t /= cv::norm(t);
+        rotations.push_back(R.clone());
+        translations.push_back(t.clone());
 
-    } else {
-        std::cerr << "Pose estimation failed." << std::endl;
+        std::vector<cv::Point3f> points3D;
+        triangulator.triangulatePoints(kp1, kp2, matches, R, t, points3D);
+
+        for (size_t j = 0; j < matches.size(); ++j) {
+            const auto& match = matches[j];
+            cv::Point2f pt2 = kp2[match.trainIdx].pt;
+
+            observations.emplace_back(BAObservation{ pt2, static_cast<int>(i + 1), static_cast<int>(structure_points.size()) });
+            structure_points.push_back(points3D[j]);
+            camera_indices.push_back(i + 1);
+            point_indices.push_back(structure_points.size() - 1);
+        }
     }
 
-    // Visualize matches
-    cv::Mat match_img;
-    cv::drawMatches(img1, kp1, img2, kp2, good_matches, match_img,
-                    cv::Scalar::all(-1), cv::Scalar::all(-1),
-                    std::vector<char>(), cv::DrawMatchesFlags::NOT_DRAW_SINGLE_POINTS);
+    // Run bundle adjustment
+    bundle_adjuster.optimize(rotations, translations, structure_points, observations);
 
-    cv::imshow("Good Matches", match_img);
-    cv::waitKey(0);
+    std::string ply_filename = "../output/bundle_adjusted_map.ply";
+    PointCloudWriter::writePLY(ply_filename, structure_points);
+    std::cout << "Saved final bundle-adjusted map with " << structure_points.size()
+              << " points to " << ply_filename << std::endl;
 
     return 0;
 }
